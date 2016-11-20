@@ -1,0 +1,32 @@
+{
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "source_ami": "ami-55d4e436",
+      "region": "ap-southeast-2",
+      "instance_type": "t2.micro",
+      "ssh_username": "ec2-user",
+      "ami_name": "docker-ami-{{isotime | clean_ami_name}}",
+      "ami_description": "Docker Host AMI (Amazon Linux, docker, docker-compose, docker-gc, jq)"
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "file",
+      "source": "conf",
+      "destination": "/tmp"
+    },
+    {
+      "type": "shell",
+      "script": "scripts/install-utils.sh"
+    },
+    {
+      "type": "shell",
+      "script": "scripts/install-awslogs.sh"
+    },
+    {
+      "type": "shell",
+      "script": "scripts/install-docker.sh"
+    }
+  ]
+}

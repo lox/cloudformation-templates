@@ -1,0 +1,431 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Application: An autoscaling group that runs exactly 1 docker host'
+
+Parameters:
+  VpcStack:
+    Type: String
+    Description: The name of the VPC stack
+
+  KeyName:
+    Description: The ssh keypair used to access the instances
+    Type: AWS::EC2::KeyPair::KeyName
+
+  AuthorizedUsersUrl:
+    Description: A url to periodically download ssh authorized_keys from
+    Type: String
+    Default: ""
+
+  InstanceType:
+    Description: The type of instance to use for the instance
+    Type: String
+    Default: t2.medium
+    MinLength: 1
+
+  RootVolumeSize:
+    Description: Size of EBS volume for root filesystem in GB.
+    Type: Number
+    Default: 50
+    MinValue: 10
+
+  ImageId:
+    Description: The AMI to use for the instance
+    Type: String
+
+  InternalHostedZone:
+    Description: The internal hosted DNS Zone
+    Type: String
+
+  ReleaseBucket:
+    Description: An S3 Bucket to load releases from
+    Type: String
+
+  ReleaseSlug:
+    Description: The release filename to deploy
+    Type: String
+
+Conditions:
+    AddDNSRecord:
+      !Not [ !Equals [ !Ref InternalHostedZone, "" ] ]
+
+Outputs:
+  LogGroupName:
+    Value: !Ref LogGroup
+
+Resources:
+  # Allow ec2 instances to assume a role and be granted the IAMPolicies
+  IAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref IAMRole ]
+
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ec2.amazonaws.com ]
+            Action: sts:AssumeRole
+      Path: /
+
+  IAMPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InstancePolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+              - cloudformation:DescribeStackResource
+              - ec2:DescribeTags
+              - autoscaling:DescribeAutoScalingInstances
+              - autoscaling:DescribeLifecycleHooks
+              - autoscaling:RecordLifecycleActionHeartbeat
+              - autoscaling:CompleteLifecycleAction
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource: "*"
+      Roles:
+        - !Ref IAMRole
+
+  ReleaseBucketPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReleaseBucketPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:Get
+              - s3:List*
+            Resource:
+              - !Sub "arn:aws:s3:::${ReleaseBucket}/*"
+              - !Sub "arn:aws:s3:::${ReleaseBucket}"
+      Roles:
+        - !Ref IAMRole
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  InternalApiListener:
+    Type : AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref InternalApiTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 6543
+      Protocol: HTTP
+
+  ExternalApiListener:
+    Type : AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ExternalApiTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 6544
+      Protocol: HTTP
+
+  LoginApiListener:
+    Type : AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoginApiTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 3116
+      Protocol: HTTP
+
+  LoginPageListener:
+    Type : AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoginPageTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+
+  FrontendListener:
+    Type : AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 6027
+      Protocol: HTTP
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - { 'Fn::ImportValue': !Sub '${VpcStack}-Subnet1Private' }
+        - { 'Fn::ImportValue': !Sub '${VpcStack}-Subnet2Private' }
+      SecurityGroups:
+        - !Ref ApplicationLoadBalancerSecurityGroup
+
+  ApplicationLoadBalancerDNSRecord:
+    Type: "AWS::Route53::RecordSet"
+    Condition: AddDNSRecord
+    Properties:
+      HostedZoneName: !Ref InternalHostedZone
+      Name: !Sub "app-lb.${InternalHostedZone}"
+      Type: "A"
+      AliasTarget:
+        HostedZoneId: !GetAtt [ "ApplicationLoadBalancer", "CanonicalHostedZoneID" ]
+        DNSName: !GetAtt [ "ApplicationLoadBalancer", "DNSName" ]
+
+  InternalApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /healthcheck
+      Name: !Sub ${AWS::StackName}-InternalApi
+      Port: 6543
+      Protocol: HTTP
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+
+  ExternalApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /healthcheck
+      Name: !Sub ${AWS::StackName}-ExternalApi
+      Port: 6544
+      Protocol: HTTP
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+
+  LoginApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /healthcheck
+      Matcher: { HttpCode: "200" }
+      Name: !Sub ${AWS::StackName}-LoginApi
+      Port: 3116
+      Protocol: HTTP
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+
+  LoginPageTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /
+      Matcher: { HttpCode: "200" }
+      Name: !Sub ${AWS::StackName}-LoginPage
+      Port: 8080
+      Protocol: HTTP
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /
+      Matcher: { HttpCode: "302" }
+      Name: !Sub ${AWS::StackName}-Frontend
+      Port: 6027
+      Protocol: HTTP
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+
+  ApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable access to ApplicationLoadBalancer
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '1'
+        ToPort: '65535'
+        CidrIp: 10.0.0.0/16
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: ApplicationLoadBalancer
+    Properties:
+      VPCZoneIdentifier:
+        - { 'Fn::ImportValue': !Sub '${VpcStack}-Subnet1Private' }
+        - { 'Fn::ImportValue': !Sub '${VpcStack}-Subnet2Private' }
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref InternalApiTargetGroup
+        - !Ref ExternalApiTargetGroup
+        - !Ref LoginApiTargetGroup
+        - !Ref LoginPageTargetGroup
+        - !Ref FrontendTargetGroup
+      Tags:
+        - { Key: Name, Value: vcat-docker, PropagateAtLaunch: true }
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: "false"
+      InstanceMonitoring: true
+      SecurityGroups: [ !Ref SecurityGroup ]
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref IAMInstanceProfile
+      KeyName: !Ref KeyName
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: !Ref RootVolumeSize, VolumeType: gp2 }
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -xv
+          /opt/aws/bin/cfn-init --region "${AWS::Region}" -s"${AWS::StackId}" -r "LaunchConfiguration"
+          /opt/aws/bin/cfn-signal --region "${AWS::Region}" --stack "${AWS::StackName}" --resource "AutoScalingGroup" -e $?
+          # Metadata changes doesn't cause instance replacement on update, so include
+          # parameters here that we want to trigger a new instance
+          # ${AuthorizedUsersUrl}
+          # s3://${ReleaseBucket}/${ReleaseSlug}
+    Metadata:
+      # see http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-init.html
+      AWS::CloudFormation::Init:
+        files:
+          /etc/awslogs/awscli.conf:
+            content: !Sub |
+              [plugins]
+              cwlogs = cwlogs
+              [default]
+              region = ${AWS::Region}
+            mode: "000444"
+            owner: root
+            group: root
+
+        config:
+          files:
+            "/etc/awslogs/awslogs.conf":
+              content: !Sub |
+                [general]
+                state_file= /var/awslogs/agent-state
+
+                [/var/log/messages]
+                file = /var/log/messages
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/messages
+                datetime_format = %b %d %H:%M:%S
+
+                [/var/log/docker]
+                file = /var/log/docker
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/docker
+                datetime_format = %Y-%m-%dT%H:%M:%S.%f
+
+                [/var/log/cfn-init-cmd.log]
+                file = /var/log/cfn-init-cmd.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+
+                [/var/log/cfn-init.log]
+                file = /var/log/cfn-init.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+
+                [/var/log/cfn-wire.log]
+                file = /var/log/cfn-wire.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-wire.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+              mode: '000444'
+              owner: root
+              group: root
+
+            "/etc/awslogs/awscli.conf":
+              content: !Sub |
+                [plugins]
+                cwlogs = cwlogs
+                [default]
+                region = ${AWS::Region}
+              mode: '000444'
+              owner: root
+              group: root
+
+          commands:
+            01-start-awslogs:
+              command: !Sub |
+                  #!/bin/bash -eu
+                  service awslogs start
+
+            02-fetch-authorized-users:
+              test: !Sub test -n "${AuthorizedUsersUrl}"
+              command: !Sub |
+                  #!/bin/bash -eu
+                  cat << EOF > /etc/cron.hourly/authorized_keys
+                  curl --silent -f "${AuthorizedUsersUrl}" > /tmp/authorized_keys
+                  mv /tmp/authorized_keys /home/ec2-user/.ssh/authorized_keys
+                  chmod 600 /home/ec2-user/.ssh/authorized_keys
+                  chown ec2-user: /home/ec2-user/.ssh/authorized_keys
+                  EOF
+                  chmod +x /etc/cron.hourly/authorized_keys
+                  /etc/cron.hourly/authorized_keys
+
+            03-download-release:
+              command: !Sub |
+                  #!/bin/bash -eux
+                  service docker start
+                  cd /root
+                  aws s3 cp s3://${ReleaseBucket}/.env .env
+                  aws s3 cp s3://${ReleaseBucket}/${ReleaseSlug} ${ReleaseSlug}
+                  tar xzvf ${ReleaseSlug}
+                  ecr_login=$(aws ecr get-login --region ${AWS::Region}) || exit 1
+                  eval "$ecr_login"
+                  docker-compose -f docker-compose.yml up -d
+
+          service:
+            sysvinit:
+              awslogs:
+                enabled: "true"
+                ensureRunning: "true"
+                files : [ "/etc/awslogs/awslogs.conf" ]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App security group
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !Ref ApplicationLoadBalancerSecurityGroup
+          FromPort: '1'
+          ToPort: '65535'

@@ -1,0 +1,204 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SSH Bastion: A publicly accessible ssh host with access to the internal network'
+
+Parameters:
+  VpcStack:
+    Type: String
+    Description: The name of the VPC stack
+
+  KeyName:
+    Description: The ssh keypair used to access the Bastion host
+    Type: AWS::EC2::KeyPair::KeyName
+
+  AuthorizedUsersUrl:
+    Description: A url to periodically download ssh authorized_keys from
+    Type: String
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for the Bastion host
+    Default: t2.nano
+
+Mappings:
+  AWSRegionToAMI:
+    ap-southeast-2: { AMIID: ami-55d4e436 }
+
+Outputs:
+  LogGroupName:
+    Value: !Ref LogGroup
+
+  SecurityGroup:
+    Value: !Ref SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup'
+
+  SSHHost:
+    Value: !GetAtt "Instance.PublicIp"
+
+  SSHUser:
+    Value: "ec2-user"
+
+Resources:
+  # Allow ec2 instances to assume a role and be granted the IAMPolicies
+  IAMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref IAMRole ]
+
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ec2.amazonaws.com ]
+            Action: sts:AssumeRole
+      Path: /
+
+  IAMPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InstancePolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStackResource
+              - ec2:DescribeTags
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource: "*"
+      Roles:
+        - !Ref IAMRole
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName : !Ref KeyName
+      IamInstanceProfile: !Ref IAMInstanceProfile
+      InstanceType: !Ref InstanceType
+      ImageId : !FindInMap [ AWSRegionToAMI, !Ref "AWS::Region", AMIID ]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: [ !Ref SecurityGroup ]
+          SubnetId: { 'Fn::ImportValue': !Sub '${VpcStack}-Subnet0Public' }
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -xv
+          /opt/aws/bin/cfn-init --region "${AWS::Region}" -s"${AWS::StackId}" -r "Instance"
+          /opt/aws/bin/cfn-signal --region "${AWS::Region}" --stack "${AWS::StackName}" --resource "Instance" -e $?
+          # Metadata changes doesn't cause instance replacement on update, so include
+          # parameters here that we want to trigger a new instance
+          # ${AuthorizedUsersUrl}
+      Tags:
+        - Key: Name
+          Value: vcat-bastion
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+
+    Metadata:
+      # see http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-init.html
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              "awslogs": []
+
+          files:
+            "/etc/awslogs/awslogs.conf":
+              content: !Sub |
+                [general]
+                state_file= /var/awslogs/agent-state
+
+                [/var/log/messages]
+                file = /var/log/messages
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/messages
+                datetime_format = %b %d %H:%M:%S
+
+                [/var/log/docker]
+                file = /var/log/docker
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/docker
+                datetime_format = %Y-%m-%dT%H:%M:%S.%f
+
+                [/var/log/cfn-init-cmd.log]
+                file = /var/log/cfn-init-cmd.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+
+                [/var/log/cfn-init.log]
+                file = /var/log/cfn-init.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+
+                [/var/log/cfn-wire.log]
+                file = /var/log/cfn-wire.log
+                log_group_name = ${LogGroup}
+                log_stream_name = {instance_id}/var/log/cfn-wire.log
+                datetime_format = %Y-%m-%d %H:%M:%S,%f
+              mode: '000444'
+              owner: root
+              group: root
+
+            "/etc/awslogs/awscli.conf":
+              content: !Sub |
+                [plugins]
+                  cwlogs = cwlogs
+                [default]
+                  region = ${AWS::Region}
+              mode: '000444'
+              owner: root
+              group: root
+
+          commands:
+            01-fetch-authorized-users:
+              test: !Sub test -n "${AuthorizedUsersUrl}"
+              command: !Sub |
+                  #!/bin/bash -eu
+                  cat << EOF > /etc/cron.hourly/authorized_keys
+                  curl --silent -f "${AuthorizedUsersUrl}" > /tmp/authorized_keys
+                  mv /tmp/authorized_keys /home/ec2-user/.ssh/authorized_keys
+                  chmod 600 /home/ec2-user/.ssh/authorized_keys
+                  chown ec2-user: /home/ec2-user/.ssh/authorized_keys
+                  EOF
+                  chmod +x /etc/cron.hourly/authorized_keys
+                  /etc/cron.hourly/authorized_keys
+
+          service:
+            sysvinit:
+              awslogs:
+                enabled: "true"
+                ensureRunning: "true"
+                files : [ "/etc/awslogs/awslogs.conf" ]
+
+  IPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      EIP: !FindInMap [ ElasticIPs, !Ref "AWS::Region", !Ref EnvironmentName ]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion security group
+      VpcId: { 'Fn::ImportValue': !Sub '${VpcStack}-VpcId' }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
