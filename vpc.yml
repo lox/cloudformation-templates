@@ -97,7 +97,7 @@ Resources:
 
   NatGateway:
     Type: 'AWS::EC2::NatGateway'
-    DependsOn: NatGateway
+    DependsOn: NatGatewayEIP
     Properties:
       AllocationId: !Sub '${NatGatewayEIP.AllocationId}'
       SubnetId: !Ref Subnet1Public
