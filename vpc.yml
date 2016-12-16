@@ -1,13 +1,14 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'VPC: one public subnet and two private subnets, across two AZs.'
+Description: 'VPC: two public, two private subnets, across two AZs.'
 
 Mappings:
   SubnetConfig:
     VPC: { CIDR: 10.0.0.0/16 }
-    Subnet0: { CIDR: 10.0.2.0/24 }
-    Subnet1: { CIDR: 10.0.3.0/24 }
-    Subnet2: { CIDR: 10.0.4.0/24 }
+    Subnet1Public:  { CIDR: 10.0.1.0/24 }
+    Subnet2Public:  { CIDR: 10.0.2.0/24 }
+    Subnet1Private: { CIDR: 10.0.3.0/24 }
+    Subnet2Private: { CIDR: 10.0.4.0/24 }
 
 Outputs:
   VpcId:
@@ -20,11 +21,17 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-InternalZone"
 
-  Subnet0Public:
-    Description: 'Subnet0 public.'
-    Value: !Ref Subnet0Public
+  Subnet1Public:
+    Description: 'Subnet1 public.'
+    Value: !Ref Subnet1Public
     Export:
-      Name: !Sub '${AWS::StackName}-Subnet0Public'
+      Name: !Sub '${AWS::StackName}-Subnet1Public'
+
+  Subnet2Public:
+    Description: 'Subnet2 public.'
+    Value: !Ref Subnet2Public
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet2Public'
 
   Subnet1Private:
     Description: 'Subnet1 private.'
@@ -83,37 +90,46 @@ Resources:
       InternetGatewayId: !Ref Gateway
       VpcId: !Ref Vpc
 
-  EIP:
+  NatGatewayEIP:
     Type: 'AWS::EC2::EIP'
     Properties:
       Domain: vpc
 
   NatGateway:
     Type: 'AWS::EC2::NatGateway'
+    DependsOn: NatGateway
     Properties:
-      AllocationId: !Sub '${EIP.AllocationId}'
-      SubnetId: !Ref Subnet0Public
+      AllocationId: !Sub '${NatGatewayEIP.AllocationId}'
+      SubnetId: !Ref Subnet1Public
 
-  Subnet0Public:
+  Subnet1Public:
     Type: AWS::EC2::Subnet
     Properties:
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [ 0, !GetAZs '' ]
-      CidrBlock: !FindInMap [ SubnetConfig, "Subnet0", "CIDR" ]
+      CidrBlock: !FindInMap [ SubnetConfig, "Subnet1Public", "CIDR" ]
+      VpcId: !Ref Vpc
+
+  Subnet2Public:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: !FindInMap [ SubnetConfig, "Subnet2Public", "CIDR" ]
       VpcId: !Ref Vpc
 
   Subnet1Private:
     Type: AWS::EC2::Subnet
     Properties:
       AvailabilityZone: !Select [ 0, !GetAZs '' ]
-      CidrBlock: !FindInMap [ SubnetConfig, "Subnet1", "CIDR" ]
+      CidrBlock: !FindInMap [ SubnetConfig, "Subnet1Private", "CIDR" ]
       VpcId: !Ref Vpc
 
   Subnet2Private:
     Type: AWS::EC2::Subnet
     Properties:
       AvailabilityZone: !Select [ 1, !GetAZs '' ]
-      CidrBlock: !FindInMap [ SubnetConfig, "Subnet2", "CIDR" ]
+      CidrBlock: !FindInMap [ SubnetConfig, "Subnet2Private", "CIDR" ]
       VpcId: !Ref Vpc
 
   RoutesPublic:
@@ -140,19 +156,25 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway
 
-  Subnet0Routes:
+  Subnet1PublicRoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref Subnet0Public
+      SubnetId: !Ref Subnet1Public
       RouteTableId: !Ref RoutesPublic
 
-  Subnet1Routes:
+  Subnet1PublicRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2Public
+      RouteTableId: !Ref RoutesPublic
+
+  Subnet1PrivateRoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref Subnet1Private
       RouteTableId: !Ref RoutesPrivate
 
-  Subnet2Routes:
+  Subnet2PrivateRoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref Subnet2Private
